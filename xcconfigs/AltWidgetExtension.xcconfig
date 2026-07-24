@@ -1,0 +1,4 @@
+#include "../Build.xcconfig"
+
+PRODUCT_BUNDLE_IDENTIFIER = $(MAIN_BUNDLE_IDENTIFIER).AltWidget
+CODE_SIGN_ENTITLEMENTS = AltWidget/AltWidgetExtension.entitlements
