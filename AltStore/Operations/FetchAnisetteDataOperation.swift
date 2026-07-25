@@ -91,7 +91,7 @@ final class FetchAnisetteDataOperation: ResultOperation<ALTAnisetteData>, WebSoc
                 continue
             }
 
-            let success = try await pingServer(url)
+            let success = await self.isServerUsable(url)
             if success {
                 let okmsg = "Found working server: \(url.absoluteString)"
                 self.verboseLog(okmsg)
@@ -111,7 +111,11 @@ final class FetchAnisetteDataOperation: ResultOperation<ALTAnisetteData>, WebSoc
         let nextIndex = (startIndex + 1) % serverUrls.count
         UserDefaults.standard.menuAnisetteURL = serverUrls[nextIndex]
 
-        throw NSError(domain: "AnisetteError", code: 0, userInfo: [NSLocalizedDescriptionKey: "No valid server found."])
+        let message = "None of the \(serverUrls.count) configured anisette servers responded correctly. Check your internet connection, then pick a different server (or refresh the server list) in Settings > Anisette Servers."
+        throw NSError(domain: "AnisetteError", code: 0, userInfo: [
+            NSLocalizedDescriptionKey: message,
+            NSLocalizedFailureReasonErrorKey: message
+        ])
     }
     
     private func showToast(viewContext: UIViewController?, message: String) {
@@ -126,104 +130,193 @@ final class FetchAnisetteDataOperation: ResultOperation<ALTAnisetteData>, WebSoc
         }
     }
 
-    private func pingServer(_ url: URL) async throws -> Bool {
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 10 // Timeout after 10 seconds
-        
-        let (_, response) = try await URLSession.shared.data(for: request)
-        let httpResponse = response as? HTTPURLResponse
-        let statusCode = httpResponse?.statusCode
-        
-        guard let statusCode = statusCode,
-              (200...299).contains(statusCode) else {
+    /// A server counts as usable only if one of the endpoints we actually fetch
+    /// from answers with JSON. A 2xx status alone is not enough: captive portals,
+    /// CDN error pages and parked domains all answer 200 with HTML, and that HTML
+    /// only fails later, as an unhelpful "data isn't in the correct format" error.
+    private func isServerUsable(_ url: URL) async -> Bool {
+        // V3 servers answer here; V1 servers 404 and fall through to the base URL.
+        let clientInfoURL = url.appendingPathComponent("v3").appendingPathComponent("client_info")
+
+        guard let isV3 = await self.respondsWithJSON(clientInfoURL) else {
+            // The host never answered, so don't spend a second timeout on it.
             return false
         }
-        
-        return true
+
+        if isV3 {
+            return true
+        }
+
+        return await self.respondsWithJSON(url) ?? false
     }
-    
-    
+
+    /// Never throws: an unreachable server must skip to the next one rather than
+    /// abort the whole search. Returns nil when the host couldn't be reached at all,
+    /// which distinguishes "dead host" from "answered, but not with anisette JSON".
+    private func respondsWithJSON(_ url: URL) async -> Bool? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10 // Timeout after 10 seconds
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+
+            guard let statusCode = (response as? HTTPURLResponse)?.statusCode,
+                  (200...299).contains(statusCode) else {
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+                self.verboseLog("\(url.absoluteString) answered with status \(statusCode)")
+                return false
+            }
+
+            guard (try? JSONSerialization.jsonObject(with: data, options: [])) != nil else {
+                self.verboseLog("\(url.absoluteString) answered with \(data.count) bytes that aren't JSON")
+                return false
+            }
+
+            return true
+        } catch {
+            self.verboseLog("Could not reach \(url.absoluteString): \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+
     // MARK: - COMMON
-    
+
+    /// Parses a response as a JSON string dictionary, replacing Foundation's opaque
+    /// "The data couldn't be read because it isn't in the correct format" error with
+    /// one that names the server and shows what it sent back instead.
+    private func parseJSONDictionary(_ data: Data, response: HTTPURLResponse?, endpoint: String, v3: Bool) throws -> [String: String] {
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data, options: [])
+        } catch {
+            throw self.serverResponseError(data: data, response: response, endpoint: endpoint, v3: v3,
+                                           detail: "sent a response that isn't valid JSON")
+        }
+
+        guard let raw = object as? [String: Any] else {
+            throw self.serverResponseError(data: data, response: response, endpoint: endpoint, v3: v3,
+                                           detail: "sent JSON that isn't an object")
+        }
+
+        // Some servers send numeric fields — X-Apple-I-MD-RINFO especially — as JSON
+        // numbers instead of strings. Accept both rather than rejecting the response.
+        var json: [String: String] = [:]
+        for (key, value) in raw {
+            if let string = value as? String {
+                json[key] = string
+            } else if let number = value as? NSNumber {
+                json[key] = number.stringValue
+            }
+        }
+
+        return json
+    }
+
+    private func serverResponseError(data: Data, response: HTTPURLResponse?, endpoint: String, v3: Bool, detail: String) -> Error {
+        let server = self.url?.absoluteString ?? "The anisette server"
+        var message = "Anisette server \(server) \(detail) at \(endpoint)."
+
+        if let statusCode = response?.statusCode {
+            message += " HTTP status \(statusCode)."
+        }
+        if let contentType = response?.value(forHTTPHeaderField: "Content-Type") {
+            message += " Content-Type: \(contentType)."
+        }
+
+        let snippet = String(data: data.prefix(200), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let snippet = snippet, !snippet.isEmpty {
+            message += " Response started with: \(snippet)"
+        } else if data.isEmpty {
+            message += " The response was empty."
+        }
+
+        // No trailing period: callers wrap this in a format string that adds its own.
+        message += " Pick a different server in Settings > Anisette Servers"
+
+        self.debugLog(message)
+
+        if v3 {
+            return OperationError.anisetteV3Error(message: message)
+        } else {
+            return OperationError.anisetteV1Error(message: message)
+        }
+    }
+
     func extractAnisetteData(_ data: Data, _ response: HTTPURLResponse?, v3: Bool) throws {
         // make sure this JSON is in the format we expect
         // convert data to json
-        if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: String] {
-            if v3 {
-                if json["result"] == "GetHeadersError" {
-                    let message = json["message"]
-                    self.verboseLog("Error getting V3 headers: \(message ?? "no message")")
-                    if let message = message,
-                       message.contains("-45061") {
-                        self.verboseLog("Error message contains -45061 (not provisioned), resetting adi.pb and retrying")
-                        Keychain.shared.adiPb = nil
-                        Task {
-                            do {
-                                try await provision()
-                            } catch {
-                                self.finish(.failure(error))
-                            }
+        let json = try self.parseJSONDictionary(data, response: response,
+                                                endpoint: v3 ? "v3/get_headers" : "/", v3: v3)
+        if v3 {
+            if json["result"] == "GetHeadersError" {
+                let message = json["message"]
+                self.verboseLog("Error getting V3 headers: \(message ?? "no message")")
+                if let message = message,
+                   message.contains("-45061") {
+                    self.verboseLog("Error message contains -45061 (not provisioned), resetting adi.pb and retrying")
+                    Keychain.shared.adiPb = nil
+                    Task {
+                        do {
+                            try await provision()
+                        } catch {
+                            self.finish(.failure(error))
                         }
-                        return
-                    } else { throw OperationError.anisetteV3Error(message: message ?? "Unknown error") }
-                }
+                    }
+                    return
+                } else { throw OperationError.anisetteV3Error(message: message ?? "Unknown error") }
             }
+        }
+        
+        // try to read out a dictionary
+        // for some reason serial number isn't needed but it doesn't work unless it has a value
+        var formattedJSON: [String: String] = ["deviceSerialNumber": "0"]
+        if let machineID = json["X-Apple-I-MD-M"] { formattedJSON["machineID"] = machineID }
+        if let oneTimePassword = json["X-Apple-I-MD"] { formattedJSON["oneTimePassword"] = oneTimePassword }
+        if let routingInfo = json["X-Apple-I-MD-RINFO"] { formattedJSON["routingInfo"] = routingInfo }
+        
+        if v3 {
+            formattedJSON["deviceDescription"] = self.clientInfo!
+            formattedJSON["localUserID"] = self.mdLu!
+            formattedJSON["deviceUniqueIdentifier"] = self.deviceId!
             
-            // try to read out a dictionary
-            // for some reason serial number isn't needed but it doesn't work unless it has a value
-            var formattedJSON: [String: String] = ["deviceSerialNumber": "0"]
-            if let machineID = json["X-Apple-I-MD-M"] { formattedJSON["machineID"] = machineID }
-            if let oneTimePassword = json["X-Apple-I-MD"] { formattedJSON["oneTimePassword"] = oneTimePassword }
-            if let routingInfo = json["X-Apple-I-MD-RINFO"] { formattedJSON["routingInfo"] = routingInfo }
-            
-            if v3 {
-                formattedJSON["deviceDescription"] = self.clientInfo!
-                formattedJSON["localUserID"] = self.mdLu!
-                formattedJSON["deviceUniqueIdentifier"] = self.deviceId!
-                
-                // Generate date stuff on client
-                let formatter = DateFormatter()
-                formatter.locale = Locale(identifier: "en_US_POSIX")
-                formatter.calendar = Calendar(identifier: .gregorian)
-                formatter.timeZone = TimeZone.init(secondsFromGMT: 0)
-                formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-                let dateString = formatter.string(from: Date())
-                formattedJSON["date"] = dateString
-                formattedJSON["locale"] = Locale.current.identifier
-                formattedJSON["timeZone"] = TimeZone.current.abbreviation()
-            } else {
-                if let deviceDescription = json["X-MMe-Client-Info"] { formattedJSON["deviceDescription"] = deviceDescription }
-                if let localUserID = json["X-Apple-I-MD-LU"] { formattedJSON["localUserID"] = localUserID }
-                if let deviceUniqueIdentifier = json["X-Mme-Device-Id"] { formattedJSON["deviceUniqueIdentifier"] = deviceUniqueIdentifier }
-                
-                if let date = json["X-Apple-I-Client-Time"] { formattedJSON["date"] = date }
-                if let locale = json["X-Apple-Locale"] { formattedJSON["locale"] = locale }
-                if let timeZone = json["X-Apple-I-TimeZone"] { formattedJSON["timeZone"] = timeZone }
-            }
-            
-            if let response = response,
-               let version = response.value(forHTTPHeaderField: "Implementation-Version") {
-                self.verboseLog("Implementation-Version: \(version)")
-            } else { self.verboseLog("No Implementation-Version header") }
-            
-            self.verboseLog("Anisette used: \(formattedJSON)")
-            self.verboseLog("Original JSON: \(json)")
-            if let anisette = ALTAnisetteData(json: formattedJSON) {
-                self.debugLog("Anisette is valid!")
-                self.finish(.success(anisette))
-            } else {
-                self.debugLog("Anisette is invalid!!!!")
-                if v3 {
-                    throw OperationError.anisetteV3Error(message: "Invalid anisette (the returned data may not have all the required fields)")
-                } else {
-                    throw OperationError.anisetteV1Error(message: "Invalid anisette (the returned data may not have all the required fields)")
-                }
-            }
+            // Generate date stuff on client
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.timeZone = TimeZone.init(secondsFromGMT: 0)
+            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+            let dateString = formatter.string(from: Date())
+            formattedJSON["date"] = dateString
+            formattedJSON["locale"] = Locale.current.identifier
+            formattedJSON["timeZone"] = TimeZone.current.abbreviation()
         } else {
+            if let deviceDescription = json["X-MMe-Client-Info"] { formattedJSON["deviceDescription"] = deviceDescription }
+            if let localUserID = json["X-Apple-I-MD-LU"] { formattedJSON["localUserID"] = localUserID }
+            if let deviceUniqueIdentifier = json["X-Mme-Device-Id"] { formattedJSON["deviceUniqueIdentifier"] = deviceUniqueIdentifier }
+            
+            if let date = json["X-Apple-I-Client-Time"] { formattedJSON["date"] = date }
+            if let locale = json["X-Apple-Locale"] { formattedJSON["locale"] = locale }
+            if let timeZone = json["X-Apple-I-TimeZone"] { formattedJSON["timeZone"] = timeZone }
+        }
+        
+        if let response = response,
+           let version = response.value(forHTTPHeaderField: "Implementation-Version") {
+            self.verboseLog("Implementation-Version: \(version)")
+        } else { self.verboseLog("No Implementation-Version header") }
+        
+        self.verboseLog("Anisette used: \(formattedJSON)")
+        self.verboseLog("Original JSON: \(json)")
+        if let anisette = ALTAnisetteData(json: formattedJSON) {
+            self.debugLog("Anisette is valid!")
+            self.finish(.success(anisette))
+        } else {
+            self.debugLog("Anisette is invalid!!!!")
             if v3 {
-                throw OperationError.anisetteV3Error(message: "Invalid anisette (the returned data may not be in JSON)")
+                throw OperationError.anisetteV3Error(message: "Invalid anisette (the returned data may not have all the required fields)")
             } else {
-                throw OperationError.anisetteV1Error(message: "Invalid anisette (the returned data may not be in JSON)")
+                throw OperationError.anisetteV1Error(message: "Invalid anisette (the returned data may not have all the required fields)")
             }
         }
     }
@@ -487,51 +580,75 @@ final class FetchAnisetteDataOperation: ResultOperation<ALTAnisetteData>, WebSoc
         self.verboseLog("Trying to get client_info")
         let clientInfoURL = self.url!.appendingPathComponent("v3").appendingPathComponent("client_info")
         
-        let (data, _) = try await URLSession.shared.data(from: clientInfoURL)
-        
-        if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: String] {
-            if let clientInfo = json["client_info"] {
-                self.verboseLog("Server is V3")
-                
-                self.clientInfo = clientInfo
-                self.userAgent = json["user_agent"]!
-                self.verboseLog("Client-Info: \(self.clientInfo!)")
-                self.verboseLog("User-Agent: \(self.userAgent!)")
-                
-                if Keychain.shared.identifier == nil {
-                    self.verboseLog("Generating identifier")
-                    var bytes = [Int8](repeating: 0, count: 16)
-                    let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-                    
-                    if status != errSecSuccess {
-                        self.debugLog("ERROR GENERATING IDENTIFIER!!! \(status)")
-                        throw OperationError.provisioningError(result: "Couldn't generate identifier", message: nil)
-                    }
-                    
-                    Keychain.shared.identifier = Data(bytes: &bytes, count: bytes.count).base64EncodedString()
-                }
-                
-                let decoded = Data(base64Encoded: Keychain.shared.identifier!)!
-                self.mdLu = decoded.sha256().hexEncodedString()
-                self.verboseLog("X-Apple-I-MD-LU: \(self.mdLu!)")
-                let uuid: UUID = decoded.object()
-                self.deviceId = uuid.uuidString.uppercased()
-                self.verboseLog("X-Mme-Device-Id: \(self.deviceId!)")
-            } else {
-                try await self.handleV1()
+        let (data, response) = try await URLSession.shared.data(from: clientInfoURL)
+        let httpResponse = response as? HTTPURLResponse
+
+        // A genuine V1 server doesn't implement this endpoint at all, so treat only
+        // "not implemented" as V1 — anything else means the server is misbehaving.
+        if let statusCode = httpResponse?.statusCode, statusCode == 404 || statusCode == 501 {
+            self.verboseLog("client_info returned \(statusCode), treating server as V1")
+            try await self.handleV1()
+            return
+        }
+
+        let json = try self.parseJSONDictionary(data, response: httpResponse, endpoint: "v3/client_info", v3: true)
+        if let clientInfo = json["client_info"] {
+            self.verboseLog("Server is V3")
+
+            guard let userAgent = json["user_agent"] else {
+                throw self.serverResponseError(data: data, response: httpResponse, endpoint: "v3/client_info", v3: true,
+                                               detail: "reported client_info without a matching user_agent")
             }
+
+            self.clientInfo = clientInfo
+            self.userAgent = userAgent
+            self.verboseLog("Client-Info: \(self.clientInfo!)")
+            self.verboseLog("User-Agent: \(self.userAgent!)")
+            
+            // The keychain survives deleting the app, so a truncated or corrupt
+            // identifier would otherwise break every reinstall from then on —
+            // and `decoded.object()` below reads 16 bytes regardless of what's
+            // actually stored. Replace anything unusable rather than trust it.
+            let storedIdentifier = Keychain.shared.identifier.flatMap { Data(base64Encoded: $0) }
+            if (storedIdentifier?.count ?? 0) != 16 {
+                self.verboseLog("Generating identifier")
+                var bytes = [Int8](repeating: 0, count: 16)
+                let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+
+                if status != errSecSuccess {
+                    self.debugLog("ERROR GENERATING IDENTIFIER!!! \(status)")
+                    throw OperationError.provisioningError(result: "Couldn't generate identifier", message: nil)
+                }
+
+                Keychain.shared.identifier = Data(bytes: &bytes, count: bytes.count).base64EncodedString()
+            }
+
+            guard let identifier = Keychain.shared.identifier,
+                  let decoded = Data(base64Encoded: identifier), decoded.count == 16 else {
+                throw OperationError.provisioningError(result: "Couldn't read a valid device identifier from the keychain", message: nil)
+            }
+            self.mdLu = decoded.sha256().hexEncodedString()
+            self.verboseLog("X-Apple-I-MD-LU: \(self.mdLu!)")
+            let uuid: UUID = decoded.object()
+            self.deviceId = uuid.uuidString.uppercased()
+            self.verboseLog("X-Mme-Device-Id: \(self.deviceId!)")
         } else {
-            throw OperationError.anisetteV3Error(message: "Couldn't fetch client info. The returned data may not be in JSON")
+            try await self.handleV1()
         }
     }
     
     private func fetchAnisetteV3(_ identifier: String, _ adiPb: String) async throws {
         try await self.fetchClientInfo()
         self.verboseLog("Fetching anisette V3")
+
+        // fetchClientInfo() replaces the stored identifier if it was unusable, so read
+        // it back rather than sending the value captured before that check.
+        let currentIdentifier = Keychain.shared.identifier ?? identifier
+
         var request = URLRequest(url: self.url!.appendingPathComponent("v3").appendingPathComponent("get_headers"))
         request.httpMethod = "POST"
         request.httpBody = try! JSONSerialization.data(withJSONObject: [
-            "identifier": identifier,
+            "identifier": currentIdentifier,
             "adi_pb": adiPb
         ], options: [])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
